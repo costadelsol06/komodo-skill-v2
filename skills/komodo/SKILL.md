@@ -440,6 +440,73 @@ guarantee every individual execution inside it succeeded silently; read the `log
 array, and follow any `see update '<id>'` reference in an error trace to get the specific
 failing execution's own detailed log.
 
+## Repo Resources — Git-Triggered Automation (PullRepo, adopting an existing clone)
+
+Komodo has a first-class `Repo` resource type (separate from `Stack`/`Build`) for
+tracking a git repository on a Server, with `CloneRepo`/`PullRepo` executions. Confirmed
+by reading Komodo's own Rust source (`client/core/rs/src/entities/repo.rs`,
+`bin/periphery/src/api/git.rs`, `lib/git/src/pull.rs`) rather than the docs site, which
+doesn't go this deep:
+
+- **HTTPS only — Komodo does not support cloning/pulling over SSH at all**, confirmed in
+  the `RepoConfig.git_account` doc comment. If you already have an SSH-based clone (e.g.
+  a deploy key you set up yourself), it will not be reused — see next point.
+- **`PullRepo` unconditionally runs `git remote set-url origin <url>` before every
+  pull**, rebuilding the remote URL from the Repo resource's own config
+  (`git_provider`/`git_account`/`repo`) every single time — this **overwrites** any
+  existing remote, including one pointed at an SSH alias. Don't hand-configure a remote
+  and expect Komodo to leave it alone.
+- **The access token is embedded directly in the URL string** (`remote_url()` in
+  `client/core/rs/src/entities/mod.rs`: `https://<user>:<token>@<provider>/<repo>`) and
+  that exact URL gets written to the repo's `.git/config` on disk via `git remote
+  set-url` — the token therefore sits in **plaintext on the Periphery host filesystem**
+  after the first pull, not just inside Komodo's own DB. Same trust level as any other
+  secret already living in a Periphery-mounted directory, but worth knowing before
+  assuming the token stays encrypted-at-rest everywhere.
+- **`RepoConfig.path`**: if absolute (leading `/`), used directly as the clone path — set
+  this to an **already-existing** git checkout's path to have Komodo adopt and manage it
+  going forward (same "adopt, don't migrate" philosophy as Stacks' "Files on Server"
+  mode). `PullRepo` checks for a `.git` dir first; if present, it pulls in place instead
+  of re-cloning.
+- **Credentials live in `git_providers` config**, not per-Repo — configured once in
+  Periphery's (or Core's) config file/env as a named account for a given provider
+  domain, then referenced from a Repo resource's `git_account` field. Fine-grained,
+  read-only GitHub PATs scoped to one repo are the natural fit here (no SSH option
+  exists to prefer instead).
+
+## Webhooks — URL Pattern and What Each Resource Type Supports
+
+Confirmed from Komodo's own docs (`docsite/docs/automate/webhooks.md`) — more capable
+than it first appears; don't assume a Procedure is the only resource that can receive a
+webhook:
+
+```
+https://<HOST>/listener/<AUTH_TYPE>/<RESOURCE_TYPE>/<ID_OR_NAME>/<EXECUTION>
+```
+
+| Resource | Available executions |
+|---|---|
+| Build | `/build` |
+| Repo | `/pull`, `/clone`, `/build` |
+| Stack | `/deploy`, `/refresh` |
+| Resource Sync | `/sync`, `/refresh` |
+| Procedure / Action | branch name to listen for (e.g. `/main`, or `/master`), or `/__ANY__` for all branches |
+
+- `AUTH_TYPE` is `github` (validates `X-Hub-Signature-256`, also covers Gitea/Forgejo) or
+  `gitlab` (validates `X-Gitlab-Token`).
+- **One shared secret for all webhooks on an instance**: `KOMODO_WEBHOOK_SECRET` in
+  Core's config/env — set once, used to validate every incoming webhook regardless of
+  resource type. Check `core_config().webhook_secret` (or the corresponding env var on
+  the Core container) before assuming you need to generate a new one per resource.
+- **A Repo's `/pull` and a Stack's `/deploy` are independent webhooks** — if you need
+  "pull, then redeploy" in a guaranteed order from a single git push, don't wire two
+  separate webhooks to a git provider and hope for correct sequencing (delivery order
+  isn't guaranteed). Instead, put `PullRepo` then `DeployStack` as two sequential stages
+  in **one Procedure**, and point the git provider's webhook at that Procedure's own
+  `/listener/github/procedure/<id>/<branch>` URL — this is also how the branch filter
+  becomes useful (only the branch that receives real merges triggers the Procedure at
+  all, so PR/feature-branch pushes from a bot like Renovate never fire it).
+
 ## Common Mistakes
 
 - **Assuming a Stack `Delete` is always safe because it was safe once.** Test in a
